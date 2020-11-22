@@ -1,0 +1,26 @@
+syntax = "proto3";
+package wire;
+
+enum DeviceType {
+    PHONE = 0;
+    PAD = 1;
+    PC = 2;
+    WEB = 3;
+    BACKEND = 4;
+}
+
+// logic bool
+enum LBool {
+    N = 0;
+    Y = 1;
+}
+
+enum ChatType {
+    SELF = 0; //自己
+    CHAT = 1; //单聊
+    GROUP = 2; //群聊
+}
+
+message  AffectedReply {
+    int32 affected_rows = 1;
+}
