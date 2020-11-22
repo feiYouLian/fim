@@ -1,4 +1,4 @@
-package wshub
+package wss
 
 import (
 	"bufio"
@@ -38,7 +38,8 @@ var wsHsHader = ws.HandshakeHeaderHTTP(http.Header{
 	"X-Go-Version": []string{runtime.Version()},
 })
 
-func upgradeConn(h *Hub, conn net.Conn, lst *peer.ClientListener) error {
+//  upgrade connection to websocket
+func upgradeConn(h *Gateway, conn net.Conn, lst *peer.ClientListener) error {
 	if atomic.LoadInt32(&h.clientNum) > int32(h.conf.MaxConnections) {
 		wr := bufio.NewWriterSize(conn, 200)
 		defer wr.Flush()
@@ -48,7 +49,7 @@ func upgradeConn(h *Hub, conn net.Conn, lst *peer.ClientListener) error {
 		return ErrMaxClientLimit
 	}
 
-	var de, tk, pi, ve, ra, addr string
+	var de, tk, pi, ve, addr string
 
 	set := func(key, value string) {
 		switch strings.ToUpper(key) {
@@ -60,8 +61,6 @@ func upgradeConn(h *Hub, conn net.Conn, lst *peer.ClientListener) error {
 			pi = value
 		case "VERSION":
 			ve = value
-		case "RATE":
-			ra = value
 		}
 	}
 	var attrs *peer.ClientAttrs
@@ -96,7 +95,7 @@ func upgradeConn(h *Hub, conn net.Conn, lst *peer.ClientListener) error {
 			if addr == "" {
 				addr = conn.RemoteAddr().String()
 			}
-			attrs, conf, err = parseParameters(h, addr, de, tk, pi, ve, ra)
+			attrs, conf, err = parseParameters(h, addr, de, tk, pi, ve)
 			if err != nil {
 				loginFailTotal.WithLabelValues(h.ID.String()).Inc()
 
@@ -133,40 +132,40 @@ func getIP(remoteAddr string) string {
 	return ipExp.ReplaceAllString(remoteAddr, "")
 }
 
-func websocketHandler(h *Hub, w http.ResponseWriter, r *http.Request, lst *peer.ClientListener) {
-	de := getFromHTTP(r, "device")
-	tk := getFromHTTP(r, "token")
-	pi := getFromHTTP(r, "ping")
-	ve := getFromHTTP(r, "version")
-	ra := r.Header.Get("rate")
+// func websocketHandler(h *Gateway, w http.ResponseWriter, r *http.Request, lst *peer.ClientListener) {
+// 	de := getFromHTTP(r, "device")
+// 	tk := getFromHTTP(r, "token")
+// 	pi := getFromHTTP(r, "ping")
+// 	ve := getFromHTTP(r, "version")
+// 	ra := r.Header.Get("rate")
 
-	attrs, conf, err := parseParameters(h, r.RemoteAddr, de, tk, pi, ve, ra)
-	if err != nil {
-		loginFailTotal.WithLabelValues(h.ID.String()).Inc()
+// 	attrs, conf, err := parseParameters(h, r.RemoteAddr, de, tk, pi, ve, ra)
+// 	if err != nil {
+// 		loginFailTotal.WithLabelValues(h.ID.String()).Inc()
 
-		if err == ErrTokenInvalid {
-			resp(w, http.StatusBadRequest, err.Error())
-			return
-		}
+// 		if err == ErrTokenInvalid {
+// 			resp(w, http.StatusBadRequest, err.Error())
+// 			return
+// 		}
 
-		resp(w, http.StatusBadRequest, err.Error())
-		return
-	}
+// 		resp(w, http.StatusBadRequest, err.Error())
+// 		return
+// 	}
 
-	conn, _, _, err := ws.UpgradeHTTP(r, w)
-	if err != nil {
-		resp(w, http.StatusBadRequest, err.Error())
-		return
-	}
+// 	conn, _, _, err := ws.UpgradeHTTP(r, w)
+// 	if err != nil {
+// 		resp(w, http.StatusBadRequest, err.Error())
+// 		return
+// 	}
 
-	err = registClient(h, conn, lst, attrs, conf)
-	if err != nil {
-		resp(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-}
+// 	err = registClient(h, conn, lst, attrs, conf)
+// 	if err != nil {
+// 		resp(w, http.StatusInternalServerError, err.Error())
+// 		return
+// 	}
+// }
 
-func registClient(h *Hub, conn net.Conn, lst *peer.ClientListener, attr *peer.ClientAttrs, conf *peer.ClientConf) error {
+func registClient(h *Gateway, conn net.Conn, lst *peer.ClientListener, attr *peer.ClientAttrs, conf *peer.ClientConf) error {
 	client := peer.NewClient(conn, lst, conf, attr)
 
 	err := client.Start()
@@ -181,7 +180,7 @@ func registClient(h *Hub, conn net.Conn, lst *peer.ClientListener, attr *peer.Cl
 	return nil
 }
 
-func parseParameters(h *Hub, rAddr, de, tk, pi, ve, ra string) (attrs *peer.ClientAttrs, conf *peer.ClientConf, err error) {
+func parseParameters(h *Gateway, rAddr, de, tk, pi, ve string) (attrs *peer.ClientAttrs, conf *peer.ClientConf, err error) {
 	if tk == "" {
 		return nil, nil, ErrTokenInvalid
 	}
@@ -208,49 +207,44 @@ func parseParameters(h *Hub, rAddr, de, tk, pi, ve, ra string) (attrs *peer.Clie
 		return nil, nil, fmt.Errorf("invalid parameter ping")
 	}
 
-	rate := int(peer.DefConf.Rate)
-	if ra != "" {
-		rate, _ = strconv.Atoi(ra)
-	}
 	conf = &peer.ClientConf{
 		RemotePing:       true,
 		PongWait:         time.Duration(ping*2)*time.Second + time.Second*5,
 		ReaderBufferSize: peer.DefConf.ReaderBufferSize,
-		Rate:             int64(rate),
 	}
 	return
 }
 
-func getFromHTTP(r *http.Request, key string) string {
-	val := r.Header.Get(key)
-	if val == "" {
-		val = r.URL.Query().Get(key)
-	}
-	return val
-}
+// func getFromHTTP(r *http.Request, key string) string {
+// 	val := r.Header.Get(key)
+// 	if val == "" {
+// 		val = r.URL.Query().Get(key)
+// 	}
+// 	return val
+// }
 
-func resp(w http.ResponseWriter, code int, body string) {
-	w.WriteHeader(code)
-	_, _ = w.Write([]byte(body))
-}
+// func resp(w http.ResponseWriter, code int, body string) {
+// 	w.WriteHeader(code)
+// 	_, _ = w.Write([]byte(body))
+// }
 
 func writeStatusText(bw *bufio.Writer, code int) {
-	bw.WriteString("HTTP/1.1 ")
-	bw.WriteString(strconv.Itoa(code))
-	bw.WriteByte(' ')
-	bw.WriteString(http.StatusText(code))
-	bw.WriteString(crlf)
-	bw.WriteString("Content-Type: text/plain; charset=utf-8")
-	bw.WriteString(crlf)
+	_, _ = bw.WriteString("HTTP/1.1 ")
+	_, _ = bw.WriteString(strconv.Itoa(code))
+	_ = bw.WriteByte(' ')
+	_, _ = bw.WriteString(http.StatusText(code))
+	_, _ = bw.WriteString(crlf)
+	_, _ = bw.WriteString("Content-Type: text/plain; charset=utf-8")
+	_, _ = bw.WriteString(crlf)
 }
 
 func writeErrorText(bw *bufio.Writer, err error) {
 	body := err.Error()
-	bw.WriteString("Content-Length: ")
-	bw.WriteString(strconv.Itoa(len(body)))
-	bw.WriteString(crlf)
-	bw.WriteString(crlf)
-	bw.WriteString(body)
+	_, _ = bw.WriteString("Content-Length: ")
+	_, _ = bw.WriteString(strconv.Itoa(len(body)))
+	_, _ = bw.WriteString(crlf)
+	_, _ = bw.WriteString(crlf)
+	_, _ = bw.WriteString(body)
 }
 
 var ngAddr = map[string]bool{

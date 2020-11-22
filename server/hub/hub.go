@@ -10,6 +10,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/klintcheng/fim/lgcluster"
 	"github.com/klintcheng/fim/peer"
 	"github.com/klintcheng/fim/server/handler"
 	"github.com/klintcheng/fim/wire"
@@ -18,22 +19,22 @@ import (
 )
 
 const (
-	// hub state
+	// lg state
 	closed = iota
 	started
 	closing
 )
 
 // ErrHubClosed ErrHubClosed
-var ErrHubClosed = errors.New("err: hub is closed")
+var ErrHubClosed = errors.New("err: lg is closed")
 
 // ErrHubStarted ErrHubStarted
-var ErrHubStarted = errors.New("err: hub is Started")
+var ErrHubStarted = errors.New("err: lg is Started")
 
 // // ProtocolHandle ProtocolHandle
 // type ProtocolHandle func(msg *wire.RelayPacket, out chan<- *wire.LocMessage)
 
-type HubConf struct {
+type ServerConfig struct {
 	ListenTCP string
 }
 
@@ -47,15 +48,16 @@ type LocMessage struct {
 	Payload  *wire.RelayPacket
 }
 
-// Hub 是一个服务中心
+// LgServer 是一个服务中心
 // 1.监听websocket连接
 // 2.维护连接
 // 3.消息下发
-type Hub struct {
-	ID ksuid.KSUID //lgserver id
+type LgServer struct {
 	sync.Mutex
+	ID           ksuid.KSUID //lgserver id
+	lgProxy      lgcluster.Proxy
 	state        int32 // 0 closed 1 started 2 closing
-	conf         HubConf
+	conf         ServerConfig
 	gateways     map[ksuid.KSUID]*peer.Server
 	lgservers    map[ksuid.KSUID]*peer.Server
 	out          chan *LocMessage
@@ -64,29 +66,30 @@ type Hub struct {
 	log          *log.Entry
 }
 
-// NewHub 创建一个 Server 对象，并初始化
-func NewHub(id ksuid.KSUID, conf HubConf) (*Hub, error) {
-	hub := &Hub{
+// NewLgServer 创建一个 Server 对象，并初始化
+func NewLgServer(id ksuid.KSUID, conf ServerConfig, proxy lgcluster.Proxy) (*LgServer, error) {
+	lg := &LgServer{
 		conf:     conf,
 		state:    closed,
+		lgProxy:  proxy,
 		connect:  make(chan *peer.Server, 1),
 		out:      make(chan *LocMessage, 100),
 		gateways: make(map[ksuid.KSUID]*peer.Server, 5),
-		log:      log.WithField("ID", id).WithField("Loc", "hub"),
+		log:      log.WithField("ID", id).WithField("Loc", "logicserver"),
 	}
 
-	protoHandler, err := handler.NewMessageHandler(id, hub)
+	protoHandler, err := handler.NewMessageHandler(id, lg)
 	if err != nil {
 		return nil, err
 	}
 
-	hub.protoHandler = protoHandler
-	return hub, nil
+	lg.protoHandler = protoHandler
+	return lg, nil
 }
 
 // Start start all handlers
-func (h *Hub) Start() error {
-	if !atomic.CompareAndSwapInt32(&h.state, closed, started) {
+func (lg *LgServer) Start() error {
+	if !atomic.CompareAndSwapInt32(&lg.state, closed, started) {
 		return ErrHubStarted
 	}
 
@@ -96,115 +99,115 @@ func (h *Hub) Start() error {
 		OnDisconnect: make(chan *peer.Server, 1),
 	}
 
-	go h.protoHandler.Start()
+	go lg.protoHandler.Start()
 
-	go h.readHandler(lst.OnMsg)
-	go h.writeHandler()
-	go h.gatewayHandler(lst.OnDisconnect)
+	go lg.readHandler(lst.OnMsg)
+	go lg.writeHandler()
+	go lg.gatewayHandler(lst.OnDisconnect)
 
 	// start http server latest
 	go func() {
-		_ = h.listen(lst)
+		_ = lg.listen(lst)
 	}()
 
-	h.log.Infof("start up")
+	lg.log.Infof("start up")
 	return nil
 }
 
 // readhandler read message
-func (h *Hub) readHandler(onMsg chan *peer.ServerMessage) {
+func (lg *LgServer) readHandler(onMsg chan *peer.ServerMessage) {
 	for msg := range onMsg { // receive message from gateway
 		buf := bytes.NewBuffer(msg.Payload)
 		relayMsg := new(wire.RelayPacket)
 		if err := relayMsg.Decode(buf); err != nil {
 			if err != io.EOF {
-				h.log.Error(err)
+				lg.log.Error(err)
 			}
 			break
 		}
 
 		//	handle message
-		h.protoHandler.Send(relayMsg)
+		lg.protoHandler.Send(relayMsg)
 	}
 }
 
 // writeHandler wirte message to gateway
-func (h *Hub) writeHandler() {
-	for locMessage := range h.out { // push message to gateway
-		h.Lock()
-		gateway, has := h.gateways[locMessage.ServerID]
-		h.Unlock()
+func (lg *LgServer) writeHandler() {
+	for locMessage := range lg.out { // push message to gateway
+		lg.Lock()
+		gateway, has := lg.gateways[locMessage.ServerID]
+		lg.Unlock()
 
 		if !has {
-			h.log.Warn("Gateway no found: ID:", locMessage.ServerID)
+			lg.log.Warn("Gateway no found: ID:", locMessage.ServerID)
 			continue
 		}
 		buf := &bytes.Buffer{}
 		err := locMessage.Payload.Encode(buf)
 		if err != nil {
-			h.log.Error("locMessage encode error", err.Error())
+			lg.log.Error("locMessage encode error", err.Error())
 			continue
 		}
 		if err := gateway.Push(buf.Bytes()); err != nil {
-			h.log.Error("send locMessage failed", err.Error())
-			writeGwFailTotal.WithLabelValues(h.ID.String(), gateway.ID.String()).Inc()
+			lg.log.Error("send locMessage failed", err.Error())
+			writeGwFailTotal.WithLabelValues(lg.ID.String(), gateway.ID.String()).Inc()
 		}
 	}
 }
 
 // handle gateway connect or disconnect
-func (h *Hub) gatewayHandler(onDisconnect chan *peer.Server) {
+func (lg *LgServer) gatewayHandler(onDisconnect chan *peer.Server) {
 	for {
 		select {
-		case p := <-h.connect:
-			h.Lock()
-			h.gateways[p.ID] = p
-			h.Unlock()
-			h.log.Infof("gateway [%s] connected", p.ID.String())
+		case p := <-lg.connect:
+			lg.Lock()
+			lg.gateways[p.ID] = p
+			lg.Unlock()
+			lg.log.Infof("gateway [%s] connected", p.ID.String())
 		case p := <-onDisconnect:
-			h.Lock()
-			delete(h.gateways, p.ID)
-			h.Unlock()
-			h.log.Infof("gateway [%s] disconnected", p.ID.String())
+			lg.Lock()
+			delete(lg.gateways, p.ID)
+			lg.Unlock()
+			lg.log.Infof("gateway [%s] disconnected", p.ID.String())
 		}
 	}
 }
 
-// Shutdown graceful shut down hub
-func (h *Hub) Shutdown(ctx context.Context) error {
-	if !atomic.CompareAndSwapInt32(&h.state, started, closing) {
+// Shutdown graceful shut down lg
+func (lg *LgServer) Shutdown(ctx context.Context) error {
+	if !atomic.CompareAndSwapInt32(&lg.state, started, closing) {
 		return ErrHubClosed
 	}
-	defer atomic.CompareAndSwapInt32(&h.state, closing, closed)
+	defer atomic.CompareAndSwapInt32(&lg.state, closing, closed)
 
-	h.Lock()
-	defer h.Unlock()
-	for _, s := range h.gateways {
+	lg.Lock()
+	defer lg.Unlock()
+	for _, s := range lg.gateways {
 		s.Close()
 	}
-	h.gateways = nil
+	lg.gateways = nil
 	return nil
 }
 
 // Listen start Listen
-func (h *Hub) listen(lst *peer.ServerListener) error {
-	h.log.Info("tcp server started, Listen ", h.conf.ListenTCP)
+func (lg *LgServer) listen(lst *peer.ServerListener) error {
+	lg.log.Info("tcp server started, Listen ", lg.conf.ListenTCP)
 
-	ln, err := net.Listen("tcp", h.conf.ListenTCP)
+	ln, err := net.Listen("tcp", lg.conf.ListenTCP)
 	if err != nil {
-		h.log.Error(err)
+		lg.log.Error(err)
 		return err
 	}
 	defer ln.Close()
 
 	handshake := peer.Handshake{
 		OnHandshake: func(req peer.HandshakeReq) (uint16, error) {
-			h.Lock()
-			defer h.Unlock()
-			if _, has := h.gateways[req.SID]; has {
+			lg.Lock()
+			defer lg.Unlock()
+			if _, has := lg.gateways[req.SID]; has {
 				return peer.CodeHandshakeDuplicatedSID, fmt.Errorf("server existed")
 			}
-			if _, has := h.lgservers[req.SID]; has {
+			if _, has := lg.lgservers[req.SID]; has {
 				return peer.CodeHandshakeDuplicatedSID, fmt.Errorf("server existed")
 			}
 			return peer.CodeHandshakeOk, nil
@@ -212,17 +215,17 @@ func (h *Hub) listen(lst *peer.ServerListener) error {
 	}
 
 	for {
-		if atomic.LoadInt32(&h.state) != started {
+		if atomic.LoadInt32(&lg.state) != started {
 			return nil
 		}
 		conn, err := ln.Accept()
 		if err != nil {
-			h.log.Error(err)
+			lg.log.Error(err)
 			continue
 		}
 		req, err := handshake.Upgrade(conn)
 		if err != nil {
-			h.log.Infof("upgrade error: %s", err)
+			lg.log.Infof("upgrade error: %s", err)
 			conn.Close()
 			continue
 		}
@@ -231,16 +234,16 @@ func (h *Hub) listen(lst *peer.ServerListener) error {
 		server.Addr = conn.RemoteAddr().String()
 		err = server.Start(conn, peer.SideServer)
 		if err != nil {
-			h.log.Error(err)
+			lg.log.Error(err)
 			continue
 		}
 
-		h.connect <- server
+		lg.connect <- server
 	}
 
 }
 
-func (h *Hub) To(gateway ksuid.KSUID, pkg *wire.RelayPacket) error {
+func (lg *LgServer) To(gateway ksuid.KSUID, pkg *wire.RelayPacket) error {
 	// TODO: handle
 	return nil
 }

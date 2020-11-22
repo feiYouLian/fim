@@ -1,4 +1,4 @@
-package wshub
+package wss
 
 import (
 	"container/list"
@@ -9,7 +9,7 @@ import (
 	"sync/atomic"
 
 	"github.com/ivpusic/grpool"
-	"github.com/klintcheng/fim/gateway/lgserver"
+	"github.com/klintcheng/fim/lgcluster"
 	"github.com/klintcheng/fim/peer"
 	"github.com/klintcheng/fim/wire"
 
@@ -51,15 +51,15 @@ type HubConf struct {
 	MaxConnections int
 }
 
-// Hub 是一个服务中心
+// Gateway 是一个服务中心
 // 1.监听websocket连接
 // 2.维护连接
 // 3.消息下发
-type Hub struct {
+type Gateway struct {
 	ID        ksuid.KSUID
 	conf      HubConf
 	state     int32
-	lgm       *lgserver.Manager
+	lgProxy   lgcluster.Proxy
 	clients   map[ksuid.KSUID]*peer.WsClient // Peer.ID => Peer
 	clientNum int32
 	relayIn   chan *wire.RelayPacket
@@ -71,22 +71,16 @@ type Hub struct {
 	log     *log.Entry
 }
 
-// NewHub 创建一个 Server 对象，并初始化
-func NewHub(id ksuid.KSUID, conf HubConf, namesrv lgserver.Namesrv) (*Hub, error) {
-	var err error
+// NewGateway 创建一个 Server 对象，并初始化
+func NewGateway(id ksuid.KSUID, conf HubConf, lgProxy lgcluster.Proxy) (*Gateway, error) {
 	// receive message from logic server
 	relayIn := make(chan *wire.RelayPacket, 1)
 
-	lgm, err := lgserver.NewManager(id, namesrv, relayIn)
-	if err != nil {
-		return nil, err
-	}
-
-	hub := &Hub{
+	hub := &Gateway{
 		conf:    conf,
-		lgm:     lgm,
 		state:   closed,
 		relayIn: relayIn,
+		lgProxy: lgProxy,
 		enqueue: make(chan *Packet, 1),
 		dequeue: make(chan *Packet, 1),
 		next:    make(chan struct{}, 1),
@@ -98,9 +92,14 @@ func NewHub(id ksuid.KSUID, conf HubConf, namesrv lgserver.Namesrv) (*Hub, error
 	return hub, nil
 }
 
+func (g *Gateway) Receive(pkt *wire.RelayPacket) error {
+	g.relayIn <- pkt
+	return nil
+}
+
 // 处理消息queue
-func (h *Hub) packetPushEnqueueHandler() {
-	h.log.Info("packetPushEnqueueHandler start")
+func (g *Gateway) packetPushEnqueueHandler() {
+	g.log.Info("packetPushEnqueueHandler start")
 	pendingMsgs := list.New()
 
 	// We keep the waiting flag so that we know if we have a pending message
@@ -109,7 +108,7 @@ func (h *Hub) packetPushEnqueueHandler() {
 	// To avoid duplication below.
 	queuePacket := func(packet *Packet, list *list.List, waiting bool) bool {
 		if !waiting {
-			h.dequeue <- packet
+			g.dequeue <- packet
 		} else {
 			list.PushBack(packet)
 		}
@@ -118,84 +117,87 @@ func (h *Hub) packetPushEnqueueHandler() {
 	}
 	for {
 		select {
-		case packet := <-h.enqueue:
+		case packet := <-g.enqueue:
 			waiting = queuePacket(packet, pendingMsgs, waiting)
-		case <-h.next:
+		case <-g.next:
 			next := pendingMsgs.Front()
 			if next == nil {
 				waiting = false
 				continue
 			}
 			val := pendingMsgs.Remove(next)
-			h.dequeue <- val.(*Packet)
+			g.dequeue <- val.(*Packet)
 		}
 	}
 }
 
 // its safe to operate map clients ,due to we do get ,remove ,add client enqueue one goroutine
-func (h *Hub) packetPushDequeueHandler() {
-	h.log.Info("packetPushDequeueHandler start")
-	for packet := range h.dequeue {
+func (g *Gateway) packetPushDequeueHandler() {
+	g.log.Info("packetPushDequeueHandler start")
+	for packet := range g.dequeue {
 		if packet == nil || packet.body == nil {
-			h.log.Warn("bad packet", packet)
+			g.log.Warn("bad packet", packet)
 			continue
 		}
 		switch packet.use {
 		case useForConnect:
-			h.handleClientConnect(packet.body.(*peer.WsClient))
+			g.handleClientConnect(packet.body.(*peer.WsClient))
 		case useForDisconnect:
-			h.handleClientDisconnect(packet.body.(*peer.WsClient))
+			g.handleClientDisconnect(packet.body.(*peer.WsClient))
 		case useForMsgRelay:
-			h.handleMsgRelay(packet.body.(*wire.RelayPacket))
+			g.handleMsgRelay(packet.body.(*wire.RelayPacket))
 		}
-		h.next <- struct{}{}
+		g.next <- struct{}{}
 	}
 }
 
-func (h *Hub) handleClientConnect(client *peer.WsClient) {
-	if _, has := h.clients[client.ID]; has {
-		h.log.Warn("client id repeated", client.ID)
+func (g *Gateway) handleClientConnect(client *peer.WsClient) {
+	if _, has := g.clients[client.ID]; has {
+		g.log.Warn("client id repeated", client.ID)
 	}
-	h.clients[client.ID] = client
+	g.clients[client.ID] = client
 	//	send a login package to login server
 	message := wire.NewMessage(wire.PIDLogin, peer.Seq.Next())
 	_ = message.Write(&wire.LoginReq{
-		GatewayId: h.ID.String(),
+		GatewayId: g.ID.String(),
 		PeerId:    client.ID.String(),
 		Username:  client.Attrs.Username,
 		Device:    wire.DeviceType(client.Attrs.Device),
 		RemoteIp:  client.Attrs.RemoteIP,
 	})
-	relayMessage := wire.NewEmptyRelayMessage(h.ID)
-	h.lgm.In() <- relayMessage
-	atomic.AddInt32(&h.clientNum, 1)
-	clientTotal.WithLabelValues(h.ID.String()).Set(float64(len(h.clients)))
+	relayMessage := wire.NewEmptyRelayMessage(g.ID)
+
+	_ = g.lgProxy.Send(relayMessage)
+
+	atomic.AddInt32(&g.clientNum, 1)
+	clientTotal.WithLabelValues(g.ID.String()).Set(float64(len(g.clients)))
 }
 
-func (h *Hub) handleClientDisconnect(client *peer.WsClient) {
-	if _, has := h.clients[client.ID]; !has {
+func (g *Gateway) handleClientDisconnect(client *peer.WsClient) {
+	if _, has := g.clients[client.ID]; !has {
 		return
 	}
-	delete(h.clients, client.ID)
+	delete(g.clients, client.ID)
 
 	//	send a logout package to login server
-	h.sendDisconnectPacket(client.ID)
+	g.sendDisconnectPacket(client.ID)
 
-	atomic.AddInt32(&h.clientNum, -1)
-	clientTotal.WithLabelValues(h.ID.String()).Set(float64(len(h.clients)))
+	atomic.AddInt32(&g.clientNum, -1)
+	clientTotal.WithLabelValues(g.ID.String()).Set(float64(len(g.clients)))
 }
 
-func (h *Hub) sendDisconnectPacket(peerID ksuid.KSUID) {
+func (g *Gateway) sendDisconnectPacket(peerID ksuid.KSUID) {
 	message := wire.NewMessage(wire.PIDLogout, peer.Seq.Next())
 	_ = message.Write(&wire.LogoutReq{
 		PeerId: peerID.String(),
 	})
-	relayMessage := wire.NewEmptyRelayMessage(h.ID)
-	h.lgm.In() <- relayMessage
+	relayMessage := wire.NewEmptyRelayMessage(g.ID)
+
+	_ = g.lgProxy.Send(relayMessage)
 }
 
 // transfer payload to receivers
-func (h *Hub) handleMsgRelay(message *wire.RelayPacket) {
+func (g *Gateway) handleMsgRelay(message *wire.RelayPacket) {
 	if len(message.Receivers) == 0 {
 		return
 	}
@@ -203,16 +205,16 @@ func (h *Hub) handleMsgRelay(message *wire.RelayPacket) {
 	header := message.Payload.Header
 
 	for _, recv := range message.Receivers {
-		if c, has := h.clients[recv]; has {
+		if c, has := g.clients[recv]; has {
 			err := c.Push(message.Payload.Bytes())
 			if err != nil {
-				h.log.Error(err)
-				pushErrorTotal.WithLabelValues(h.ID.String(), header.GetPID().String()).Inc()
+				g.log.Error(err)
+				pushErrorTotal.WithLabelValues(g.ID.String(), header.GetPID().String()).Inc()
 			}
 			aff++
 		} else {
-			h.log.Debugf("client no found, peer_id:%s", recv.String())
-			h.sendDisconnectPacket(recv)
+			g.log.Debugf("client no found, peer_id:%s", recv.String())
+			g.sendDisconnectPacket(recv)
 		}
 	}
 	if aff == 0 {
@@ -224,25 +226,25 @@ func (h *Hub) handleMsgRelay(message *wire.RelayPacket) {
 		"to":       message.Receivers,
 	}).Debug("message delivery: ", header)
 
-	messageTotal.WithLabelValues(h.ID.String(), header.GetPID().String(), msgDirectionPush).Inc()
+	messageTotal.WithLabelValues(g.ID.String(), header.GetPID().String(), msgDirectionPush).Inc()
 
 	// handle kickOut message
 	if header.GetPID() == wire.PIDKickOut {
 		kickOut, _ := message.Payload.GetPayloadEntity()
 		pid, _ := ksuid.Parse(kickOut.(*wire.KickOut).PeerId)
-		if client, has := h.clients[pid]; has {
-			h.log.Debug("kickout peerID: ", client.ID)
-			delete(h.clients, pid)
+		if client, has := g.clients[pid]; has {
+			g.log.Debug("kickout peerID: ", client.ID)
+			delete(g.clients, pid)
 			client.Close()
 		}
 	}
 }
 
 // Listen start Listen
-func (h *Hub) listen(lst *peer.ClientListener) error {
-	ssl, addr := h.conf.SSL, h.conf.Listen
+func (g *Gateway) listen(lst *peer.ClientListener) error {
+	ssl, addr := g.conf.SSL, g.conf.Listen
 
-	h.log.Info("tcp server started, Listen ", addr)
+	g.log.Info("tcp server started, Listen ", addr)
 	var ln net.Listener
 	var err error
 	if ssl {
@@ -264,19 +266,19 @@ func (h *Hub) listen(lst *peer.ClientListener) error {
 	defer ln.Close()
 	pool := grpool.NewPool(200, 1000)
 	for {
-		if !h.IsOpen() {
+		if !g.IsOpen() {
 			return nil
 		}
 		conn, err := ln.Accept()
 		if err != nil {
-			h.log.Error(err)
+			g.log.Error(err)
 			continue
 		}
 
 		pool.JobQueue <- func() {
-			if err = upgradeConn(h, conn, lst); err != nil {
+			if err = upgradeConn(g, conn, lst); err != nil {
 				conn.Close()
-				h.log.Debug(err)
+				g.log.Debug(err)
 			}
 		}
 	}
@@ -284,8 +286,8 @@ func (h *Hub) listen(lst *peer.ClientListener) error {
 }
 
 // Start start all handlers
-func (h *Hub) Start() error {
-	if !atomic.CompareAndSwapInt32(&h.state, closed, started) {
+func (g *Gateway) Start() error {
+	if !atomic.CompareAndSwapInt32(&g.state, closed, started) {
 		return ErrHubStarted
 	}
 
@@ -295,29 +297,27 @@ func (h *Hub) Start() error {
 		OnDisconnect: make(chan *peer.WsClient, 1),
 	}
 
-	h.lgm.Start(true)
+	go g.packetPushEnqueueHandler()
+	go g.packetPushDequeueHandler()
 
-	go h.packetPushEnqueueHandler()
-	go h.packetPushDequeueHandler()
-
-	go h.handleClientEvents(lst)
-	go h.handleSeverEvents()
+	go g.handleClientEvents(lst)
+	go g.handleSeverEvents()
 
 	// start http server latest
 	go func() {
-		if err := h.listen(lst); err != nil {
+		if err := g.listen(lst); err != nil {
 			log.Panic(err)
 		}
 	}()
 
-	log.Infof("gateway[%v] start up", h.ID.String())
+	log.Infof("gateway[%v] start up", g.ID.String())
 	return nil
 }
 
 // handle client peer message
 // 1. decode a message from client , send to hub.enqueue
-// 2. wrap a disconnected connection ,send to lgm.enqueue
-func (h *Hub) handleClientEvents(lst *peer.ClientListener) {
+// 2. wrap a disconnected connection ,send to lgProxy.enqueue
+func (g *Gateway) handleClientEvents(lst *peer.ClientListener) {
 	for {
 		select {
 		case recvMsg := <-lst.OnMsg:
@@ -327,59 +327,58 @@ func (h *Hub) handleClientEvents(lst *peer.ClientListener) {
 				continue
 			}
 			log.Trace(recvMsg.Payload)
-			messageFlowBytes.WithLabelValues(h.ID.String(), pid.String()).Add(float64(len(recvMsg.Payload.Payload)))
-			messageTotal.WithLabelValues(h.ID.String(), pid.String(), msgDirectionUp).Inc()
+			messageFlowBytes.WithLabelValues(g.ID.String(), pid.String()).Add(float64(len(recvMsg.Payload.Payload)))
+			messageTotal.WithLabelValues(g.ID.String(), pid.String(), msgDirectionUp).Inc()
 
-			relayMsg := wire.NewRelayMessage(recvMsg.ID, recvMsg.Attrs.Username, recvMsg.Attrs.Device, h.ID)
+			relayMsg := wire.NewRelayMessage(recvMsg.ID, recvMsg.Attrs.Username, recvMsg.Attrs.Device, g.ID)
 			relayMsg.Payload = recvMsg.Payload
 
-			h.lgm.In() <- relayMsg
+			_ = g.lgProxy.Send(relayMsg)
+
 		case client := <-lst.OnDisconnect:
-			_ = h.Push(&Packet{useForDisconnect, client})
+			_ = g.Push(&Packet{useForDisconnect, client})
 		}
 	}
 }
 
 // build a packet with dequeue message from logic server，and send to channel enqueue of hub
-func (h *Hub) handleSeverEvents() {
-	for msg := range h.relayIn {
-		h.enqueue <- &Packet{useForMsgRelay, msg}
+func (g *Gateway) handleSeverEvents() {
+	for msg := range g.relayIn {
+		g.enqueue <- &Packet{useForMsgRelay, msg}
 	}
 }
 
 // Push push packet to hub
-func (h *Hub) Push(p *Packet) error {
-	if atomic.LoadInt32(&h.state) != started {
+func (g *Gateway) Push(p *Packet) error {
+	if atomic.LoadInt32(&g.state) != started {
 		return ErrHubClosed
 	}
-	h.enqueue <- p
+	g.enqueue <- p
 	return nil
 }
 
 // Shutdown graceful shut down hub
-func (h *Hub) Shutdown() error {
-	if !atomic.CompareAndSwapInt32(&h.state, started, closing) {
+func (g *Gateway) Shutdown() error {
+	if !atomic.CompareAndSwapInt32(&g.state, started, closing) {
 		return ErrHubClosed
 	}
-	defer atomic.CompareAndSwapInt32(&h.state, closing, closed)
+	defer atomic.CompareAndSwapInt32(&g.state, closing, closed)
 
-	for _, client := range h.clients {
-		h.sendDisconnectPacket(client.ID)
+	for _, client := range g.clients {
+		g.sendDisconnectPacket(client.ID)
 		client.Close()
 		log.Infof("close client %s %s %s", client.Attrs.Username, client.Attrs.Username, client.Attrs.RemoteIP)
 	}
 
-	h.lgm.Shutdown()
-
-	h.clients = nil
-	h.lgm = nil
+	g.clients = nil
+	g.lgProxy = nil
 
 	return nil
 }
 
 //IsOpen detect whether is hub open
-func (h *Hub) IsOpen() bool {
-	return atomic.LoadInt32(&h.state) == started
+func (g *Gateway) IsOpen() bool {
+	return atomic.LoadInt32(&g.state) == started
 }
 
 type Token struct {
@@ -388,7 +387,7 @@ type Token struct {
 }
 
 // TODO: pasre tokenn
-func (h *Hub) parseToken(tk string) (*Token, error) {
+func (g *Gateway) parseToken(tk string) (*Token, error) {
 
 	return nil, nil
 }

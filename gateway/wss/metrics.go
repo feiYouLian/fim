@@ -1,4 +1,4 @@
-package wshub
+package wss
 
 import (
 	"github.com/prometheus/client_golang/prometheus"

@@ -1,15 +1,14 @@
-package main
+package hub
 
 import (
-	"os"
-	"os/signal"
-	"syscall"
+	_ "expvar"
+	_ "net/http/pprof"
 
-	"github.com/klintcheng/fim/gateway/wss"
+	"runtime"
+
 	"github.com/klintcheng/fim/lgcluster"
 	"github.com/klintcheng/fim/namesrv/client"
-	"github.com/sirupsen/logrus"
-
+	"github.com/klintcheng/fim/server/hub"
 	"github.com/segmentio/ksuid"
 	"github.com/spf13/viper"
 )
@@ -22,12 +21,13 @@ func Id() (ksuid.KSUID, error) {
 	return id, err
 }
 
-func main() {
+// Main enter system
+func Main() {
+	runtime.GOMAXPROCS(runtime.NumCPU())
 	id, err := Id()
 	if err != nil {
 		panic(err)
 	}
-
 	namesrv, err := client.NewNamingClient(client.Options{})
 	if err != nil {
 		panic(err)
@@ -38,22 +38,12 @@ func main() {
 		panic(err)
 	}
 
-	h, err := wss.NewGateway(id, wss.HubConf{
-		JwtAppkey: viper.GetString("appkey"),
-		JwtSecret: viper.GetString("secret"),
-		Listen:    viper.GetString("listen"),
-		SSL:       viper.GetBool("ssl"),
+	lg, err := hub.NewLgServer(id, hub.ServerConfig{
+		ListenTCP: viper.GetString("listen"),
 	}, proxy)
 	if err != nil {
 		panic(err)
 	}
+	lg.Start()
 
-	if err := h.Start(); err != nil {
-		panic(err)
-	}
-
-	quit := make(chan os.Signal, 1)
-	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-
-	logrus.Info("Shutdown Server ...", <-quit)
 }

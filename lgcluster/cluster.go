@@ -1,4 +1,4 @@
-package lgserver
+package lgcluster
 
 import (
 	"fmt"

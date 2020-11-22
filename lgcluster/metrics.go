@@ -1,10 +1,10 @@
-package lgserver
+package lgcluster
 
 import (
 	"github.com/prometheus/client_golang/prometheus"
 )
 
-var metricsNamespace = "im"
+var metricsNamespace = "fim"
 
 const (
 	msgDirectionUp   = "upload"
